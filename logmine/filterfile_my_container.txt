@@ -1,0 +1,6 @@
+PSYoungGen
+Periodic check interval not satisfied
+UpdateCheckAllowed
+Memory is used/total/max
+GC last/max
+Job is in state JOB_STATE_RUNNING
