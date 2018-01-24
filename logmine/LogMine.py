@@ -155,25 +155,16 @@ class LogMine():
             self.logger.error(traceback.format_exc())
 
     def do_parse(self, input_file):
-        """ parse the raw log into a csv file, then into a pandas dataframe and write that out to file  """
+        """ parse the raw log into a pandas dataframe and write that out to file  """
         self.results = []
-
-        # read in the raw log file
         infile = input_file
         r = open(infile, 'r').readlines()
-
-        # format and output as csv file
-        csv_file = infile + '.csv'
-        r2 = open(csv_file, 'w')
         for rr in r:
             rr = rr.replace('[', '').replace(']','').replace("'","")
-            self.results.append(rr)
-            r2.write(rr + '\n')
-        r2.flush()
-        r2.close()
+            self.results.append(rr.split(','))
 
-        # convert the revised csv file into a pandas dataframe for later use in parsing
-        self.df = pd.read_csv(csv_file, sep=",", names=['Level','Time','Text'], engine='python', dtype=str)
+        # convert the input file into a pandas dataframe for later use in parsing
+        self.df = pd.DataFrame(self.results, columns=['Level','Time','Text'])
         self.df.Time = pd.to_datetime(self.df.Time, infer_datetime_format=True) # format="%Y-%m-%dT%H:%M:%SZ")
         self.df['Text'] = self.df.Text.astype(str)
         self.logger.info(self.df.head(5))
@@ -335,7 +326,7 @@ class LogMine():
         self.stopfile_data.update(new_data)
 
         with open(outfile, 'w') as f:
-            json.dump(self.stopfile_data, f)
+            json.dump(self.stopfile_data, f, indent=4, sort_keys=True)
 
     def write_newfile(self, new_data):
         """
@@ -346,7 +337,7 @@ class LogMine():
         outfile = '{}/newfile_{}.json'.format(self.args.output_dir, self.args.source)
 
         with open(outfile, 'w') as f:
-            json.dump(new_data, f)
+            json.dump(new_data, f, indent=4, sort_keys=True)
 
     def get_dataflow_job_by_name(self, job_name, page_size=5000):
         """
