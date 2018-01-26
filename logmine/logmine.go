@@ -7,17 +7,17 @@ import (
 	"golang.org/x/net/context"
 	"cloud.google.com/go/logging"
 	"cloud.google.com/go/logging/logadmin"
-	//"google.golang.org/api/dataflow/v1b3"
+	"google.golang.org/api/dataflow/v1b3"
 	"google.golang.org/api/iterator"
 	"log"
 	"time"
 	"os"
 	"bufio"
-	//"encoding/gob"
-	"net/smtp"
-	//"io/ioutil"
 	"runtime"
 	"encoding/json"
+	"gopkg.in/gomail.v2"
+	"strconv"
+	"golang.org/x/oauth2/google"
 )
 
 /*
@@ -26,7 +26,16 @@ go run logmine.go \
 -outputDir=./output \
 -source=qa_trinity \
 -maxEntryCount=20 \
+-rangeInMinutes=10 \
 -outputFile=qa_trinity_output.log
+
+go run logmine.go \
+-logFilter='resource.type=dataflow_step resource.labels.job_id=DATAFLOW_JOB_NAME' \
+-outputDir=./output \
+-source=qa-trinity-event-store \
+-maxEntryCount=20 \
+-rangeInMinutes=10 \
+-outputFile=qa_trinity_event_store_output.log
  */
 
 type StopFile struct {
@@ -151,12 +160,11 @@ func doQuery(adminClient *logadmin.Client, mine logmine) ([]*logging.Entry, erro
 }
 
 func doProcess(mine logmine, entries []*logging.Entry) ([]StopFile, []StopFile) {
-	stopfile := []StopFile{}
 	var newData = []StopFile{}
 	var dataCounts = make(map[string] int)
 
 	// read in existing stopfile, if any
-	readStopfile(mine)
+	stopfile, err := readStopfile(mine)
 
 	// read in the filter file data, if any
 	filterFileData, _ := readFilterfile(mine)
@@ -168,8 +176,10 @@ func doProcess(mine logmine, entries []*logging.Entry) ([]StopFile, []StopFile) 
 		entry := doFilter(mine, payload, filterFileData)  // match against filter file data
 		//fmt.Printf("doProcess.entry: %s\n\n", entry)
 		if _, ok := dataCounts[entry]; ok {
+			//fmt.Printf("incrementing dataCount for %s\n", entry)
 			dataCounts[entry] += 1
 		} else {
+			//fmt.Printf("initializing dataCount for %s\n", entry)
 			dataCounts[entry] = 1
 		}
 	}
@@ -180,13 +190,19 @@ func doProcess(mine logmine, entries []*logging.Entry) ([]StopFile, []StopFile) 
 		//fmt.Printf("k = %s, v = %d\n", k, v)
 		var foundEntry = false
 		for i := range stopfile {
-			if strings.Contains(stopfile[i].entry, k) {
+			//fmt.Printf("stopfile entry: %s\n", stopfile[i].entry)
+			a := strconv.QuoteToASCII(stopfile[i].entry)
+			b := strconv.QuoteToASCII(k)
+			if strings.Contains(a, b) {
 				stopfile[i].count = append(stopfile[i].count, v)
+				if len(stopfile[i].count) > mine.count {
+					stopfile[i].count = stopfile[i].count[len(stopfile[i].count)-mine.count:]
+				}
 				foundEntry = true
 				break
 				}
 		}
-		if !foundEntry {
+		if foundEntry == false {
 			var c = make([]int,0)
 			c = append(c, v)
 			stopfile = append(stopfile, StopFile{entry: k, count: c})
@@ -195,7 +211,7 @@ func doProcess(mine logmine, entries []*logging.Entry) ([]StopFile, []StopFile) 
 	}
 
 	fmt.Printf("stopfile: %v\n\n", stopfile)
-	err := writeStopfile(mine, stopfile)
+	err = writeStopfile(mine, stopfile)
 	Check(err)
 
 	fmt.Printf("newData: %v\n\n", newData)
@@ -223,16 +239,40 @@ func doFilterRevisions(mine logmine) string {
 		newFilter = strings.Replace(mine.filter, "DATAFLOW_JOB_NAME", getDataflowJobByName(mine), 1)
 	}
 
-	if mine.minutes > 0 { // TODO
-		//start_time = (datetime.now() - timedelta(minutes=self.args.range_in_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ').upper()
-		//newFilter = newFilter + " timestamp > \"%s\"", start_time
+	if mine.minutes > 0 { // TODO verify this works. saw weird stuff on https://play.golang.org/
+		minutes := time.Duration(mine.minutes)
+		currentTime := time.Now()
+		//fmt.Println("Current Time in String: ", currentTime.String())
+		after := currentTime.Add(-minutes*time.Minute)
+		newAfter := fmt.Sprintf(after.Format(time.RFC3339))
+		newFilter = fmt.Sprintf("%s timestamp > \"%v\"", newFilter, newAfter)
+		fmt.Println(newFilter)
 	}
 
 	return newFilter
 }
 
 func getDataflowJobByName(mine logmine) string {
-	return "XXX"  // TODO
+	var jobId = "DATAFLOW_JOB_NOT_FOUND"
+	ctx := context.Background()
+	oauthHttpClient, err := google.DefaultClient(ctx,
+		"https://www.googleapis.com/auth/devstorage.full_control")
+	if err != nil {
+		log.Fatal(err)
+	}
+	dataflowService, err := dataflow.New(oauthHttpClient)
+	f := dataflowService.Projects.Jobs.List(mine.project)
+	f.Filter("ACTIVE")
+	jobs, err := f.Do()
+	for _, job := range jobs.Jobs {
+		//fmt.Printf("Name: %s, Id: %s\n", job.Name, job.Id)
+		if strings.Contains(job.Name, mine.source) {
+			jobId = job.Id
+			fmt.Printf("found dataflow job name: %s, returning job id: %s\n", job.Name, job.Id)
+			break
+		}
+	}
+	return jobId
 }
 
 func writeTextfile(outfile string, stopfiles []StopFile) error {
@@ -302,17 +342,35 @@ func Check(e error) {
 	}
 }
 
-func doSendMail(mine logmine, sender string, recipient []string,  object interface{}) error {
-	auth := smtp.PlainAuth("", mine.user, mine.password, "localhost")
+func doSendMail(mine logmine, sender string, recipients []string,  data []StopFile)  {
+	//auth := smtp.PlainAuth("", mine.user, mine.password, "localhost")
+	htmlData := "<body><table border=2><tr><td> New Entries </td><td> Entry Count </td></tr>"
+	for _, v := range data {
+		htmlDataPart := fmt.Sprintf("<tr><td>%s</td><td>%v</td></tr>", v.entry, v.count)
+		htmlData += htmlDataPart
+	}
+	htmlData += "</table></body>"
+	//mime := "MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\n\n";
+	subj := fmt.Sprintf("(%s) Log Mine [Go]: %s - %s", mine.project, mine.source, time.Now())
+	// msg := []byte(subj + mime + htmlData)
 
-	subj := fmt.Sprintf("(%s) Log Mine: %s - %s", mine.project, mine.source, time.Now())
-	msg := []byte(fmt.Sprintf("To: %s\r\n" +
-		"Subject: %s\r\n" +
-		"\r\n" +
-		"%v\r\n", recipient, subj, object))
+	for _, recipient := range recipients {
+		m := gomail.NewMessage()
+		m.SetHeader("From", sender)
+		m.SetHeader("To", recipient)
+		m.SetHeader("Subject", subj)
+		m.SetBody("text/html", htmlData)
+
+		// Send the email
+		d := gomail.NewPlainDialer("localhost", 25, mine.user, mine.password)
+		if err := d.DialAndSend(m); err != nil {
+			fmt.Println(err)
+		}
+	}
+	/*
 	err := smtp.SendMail("localhost:25", auth, sender, recipient, msg)
 	if err != nil {
 		fmt.Printf("sendmail error: %s", err)
 	}
-	return err
+	*/
 }
