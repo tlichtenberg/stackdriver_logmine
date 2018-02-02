@@ -1,21 +1,19 @@
 from argparse import ArgumentParser
+from boom.common.utils import init_logger
+from boom.common.utils import dynamite_parser
+from boom.dynamite.DynamitePod import DynamitePod
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from google.cloud.gapic.logging.v2 import logging_service_v2_client
-from google.cloud import logging
-from googleapiclient import discovery
 from importlib import import_module
-import json
-import logging as logger
-from oauth2client.client import GoogleCredentials
-import pandas as pd
 import re
 import smtplib
-import sys
 import traceback
 
-DEBUG = sys.flags.debug
+FILTER2 = True
+
+if FILTER2:
+    from FilterFinder import FilterFinder
 
 SEVERITY = {
                0:  "DEFAULT",    # (0) The log entry has no assigned severity level",
@@ -32,68 +30,71 @@ SEVERITY = {
 
 class LogMine():
     def __init__(self):
-        self.logger = None
-        self.init_logger('LogMine')
+        self.logger = init_logger('LogMine')
         self.args = self.arguments()
         self.results = list()
         self.new_data = dict()
         self.stopfile_data = {}
         self.filterfile_data = []
+        self.min_len = 16
+        self.max_len = 64
+        self.max_substring_length = 128  # truncate log entry payloads to 1st N characters if FILTER2
         self.df = None  # pandas dataframe
-        self.logger_client = logging_service_v2_client.LoggingServiceV2Client()
-        self.credentials = GoogleCredentials.get_application_default()
-        self.dataflow_service = discovery.build('dataflow', 'v1b3', credentials=self.credentials)
 
-        if self.args.query:
-            """
-              get the logs from stackdriver and write to stdout
-            """
-            self.do_query()  #
-            for result in self.results:
-                self.logger.debug(result)
-            self.write_results('{}/{}'.format(self.args.output_dir, self.args.output_file))
+        self.dynamite = DynamitePod(pod=self.args.pod,
+                                    realm=self.args.realm,
+                                    zone=self.args.zone,
+                                    project=self.args.project,
+                                    cloud=self.args.cloud,
+                                    user=self.args.user)
 
-        if self.args.parse:
-            """
-            parse the fetched logs and output to formatted file
-            """
-            self.do_parse('{}/{}'.format(self.args.output_dir, self.args.output_file)) # output from query is input to parse
+        if self.args.send_file:
+            self.send_requested_file()
+        else:
+            self.logger.info('do query')
+            entries = self.do_query()
+            self.logger.debug('list entries')
+            for entry in entries:
+                self.logger.debug(entry)
+            self.logger.info('output raw results to file')
+            self.write_raw_results('{}/{}'.format(self.args.output_dir, self.args.output_file), entries)
 
-        if self.args.process:
-            """
-            look for new input (based on a stopfile) and report it, then
-            update the stopfile with the new input
-            
-            use optional output_file arg in case of pre-existing file (no query and no parse)
-            """
-            self.do_process('{}/{}'.format(self.args.output_dir, self.args.output_file))
+            # look for new input (based on what is not in the stopfile) and report it, then
+            # update the stopfile with the new input
+            # use optional output_file arg in case of pre-existing file (no query and no parse)
+            self.logger.info('do process')
+            self.do_process(entries)
 
-        """
-        send notification emails if sender, recipients and new_data are not None
-        """
-        if self.args.sender and self.args.recipients and self.new_data:
-            for recipient in self.args.recipients:
-                self.do_sendmail(self.args.sender, recipient, self.new_data)
+            # send notification emails if sender, recipients and new_data        if self.args.sender and self.args.recipients and self.new_data:
+            if self.new_data:
+                self.logger.info('send notification(s)')
+                for recipient in self.args.recipients:
+                    self.do_sendmail(self.args.sender, recipient, self.new_data)
+
+            # write out the new filter_file, including existing and new entries found by FilterFinder
+            self.logger.info('write filter file')
+            self.write_filter_file()
 
     def arguments(self):
-        parser = ArgumentParser()
-        parser.add_argument('--query', action='store_true')
-        parser.add_argument('--process', action='store_true')
-        parser.add_argument('--parse', action='store_true')
-        parser.add_argument('--project', required=True, help='your GCP project name')
-        parser.add_argument('--output_dir', default='/tmp')
+        """
+        argument parser
+        :return: parsed args
+        """
+        parser = ArgumentParser(parents=[dynamite_parser()])
         parser.add_argument('--limit', default=100, type=int, help='number of log entries to retrieve')
         parser.add_argument('--max_entry_count', default=20, type=int, help='max per log entry to save to file')
+        parser.add_argument('--output_dir', default='/tmp')
         parser.add_argument('--range_in_minutes', type=int, default=0)
-        parser.add_argument('--sender', default=None, help='your email sender')
-        parser.add_argument('--recipients', nargs='+', default=[], help='list of email recipients')
+        parser.add_argument('--sender', default='no-reply@nestlabs.com')
+        parser.add_argument('--recipients', nargs='+', default=['tlichtenberg@google.com'])
+        parser.add_argument('--output_file',  required=True)
+        parser.add_argument('--send_file', default=False, type=bool, help="request an email containing the file specified in output_dir and output_file")
         known_args = parser.parse_known_args()
 
         # dependent args
-        parser.add_argument('--log_filter', required=known_args[0].query == True, help='log query filter')
-        parser.add_argument('--output_file',  required=known_args[0].parse == True)
-        parser.add_argument('--source', required=known_args[0].process == True,
-                            help="for stopfile_<source>.json, newfile_<source>.json and filterfile_<source>.txt")
+        parser.add_argument('--log_filter', required=known_args[0].send_file == False)
+        parser.add_argument('--source', required=known_args[0].send_file == False,
+                            help="for stopfile_<source>.json and newfile_<source>.json")
 
         return parser.parse_args()
 
@@ -102,86 +103,107 @@ class LogMine():
         performs the stackdriver log query, putting annotated results into the self.results list
         :return:
         """
-        # initialize raw_entries and filterfile_data
-        self.read_filterfile()
-
-        # do optional filter revisions for timestamp, limit and dataflow job name as applicable
+        # initialize raw_entries, filterfile_data and optional filter revisions
+        raw_entries = []
+        entries = []
+        self.read_filter_file()
         self.do_filter_revisions()
         self.logger.info(self.args.log_filter)
 
+        # get log entries
         try:
-            raw_entries = self.get_log_entries(log_filter=self.args.log_filter, limit=self.args.limit)
-            for entry in raw_entries:
-                output = []
-                self.logger.debug('* * * RAW ENTRY: {}'.format(entry))
-                if len(entry.text_payload) > 0:
-                    try:
-                        # lose any commas and newlines in the entry string
-                        output.append(str(entry.text_payload).replace(',','').replace('\n', ''))
-                    except:
-                        self.logger.error(traceback.format_exc())
-
-                elif entry.json_payload:
-                    try:
-                        # lose any commas and newlines in the entry string
-                        output.append(str(entry.json_payload['message']).replace(',', '').replace('\n', ''))
-                    except:
-                        self.logger.error(traceback.format_exc())
-
-                elif entry.proto_payload:
-                    class_ = getattr(import_module('google.protobuf.any_pb2'), 'Any')  # class reference
-                    try:
-                        if entry.proto_payload.type_url.find('AuditLog') < 0:
-                            rv = class_()  # instantiate class instance
-                            # decode Any.value
-                            rv.ParseFromString(entry.proto_payload.value)
-                            # lose any commas and newlines in the entry string
-                            output.append(str(rv).replace(',', '').replace('\n', ''))
-                        else:
-                            # lose any commas and newlines in the entry string
-                            output.append(str(entry.proto_payload.value).replace(',', '').replace('\n', ''))
-                    except:
-                        self.logger.error(traceback.format_exc())
-
-                if output:
-                    # use the filterfile to consolidate common entries
-                    output[0] = self.do_filter(output[0])
-                    self.logger.info('payload: {}'.format(output))
-                    # prepend the severity and the timestamp into the results list for later pandas dataframe use
-                    output.insert(0, datetime.fromtimestamp(entry.timestamp.seconds).strftime('%Y-%m-%dT%H:%M:%SZ'))
-                    output.insert(0, SEVERITY[entry.severity])
-                    self.results.append(str(output))
+            raw_entries = self.get_log_entries()
         except:
             self.logger.error(traceback.format_exc())
 
-    def do_parse(self, input_file):
-        """ parse the raw log into a pandas dataframe and write that out to file  """
-        self.results = []
-        infile = input_file
-        r = open(infile, 'r').readlines()
-        for rr in r:
-            rr = rr.replace('[', '').replace(']','').replace("'","")
-            self.results.append(rr.split(','))
+        # generate live append to filterfile_data from the raw_entries by analyzing for common substrings
+        payloads = []
+        for entry in raw_entries:
+            self.logger.debug('* * * RAW ENTRY: {}'.format(entry))
+            payload = self.get_payload(entry)
+            final_entry = self.prep_entry(payload)
+            self.logger.debug('* * * FINAL ENTRY: len() {}, {}'.format(len(final_entry), final_entry))
+            payloads.append(final_entry)
 
-        # convert the input file into a pandas dataframe for later use in parsing
-        self.df = pd.DataFrame(self.results, columns=['Level','Time','Text'])
-        self.df.Time = pd.to_datetime(self.df.Time, infer_datetime_format=True) # format="%Y-%m-%dT%H:%M:%SZ")
-        self.df['Text'] = self.df.Text.astype(str)
-        self.logger.info(self.df.head(5))
-        parsed_file = infile + '.df'
-        self.write_results(parsed_file)
+        if FILTER2:
+            p2 = []
+            for p in payloads:
+                p = p[:self.max_substring_length]  # truncate for substring matching
+                p2.append(p)
+            self.logger.debug('len payloads list: {}'.format(len(p2)))
+            if len(p2) > 0:
+                finder = FilterFinder(p2)
+                finder_list = finder.run()
+                for item in finder_list:
+                    self.logger.info("adding {} to filterfile_data".format(item))
+                    self.filterfile_data.append(item)
+
+        for payload in payloads:
+            output = [payload]
+            if output:
+                output[0] = self.do_filter(output[0])
+                self.logger.debug('payload: {}'.format(output))
+                output.insert(0, datetime.fromtimestamp(entry.timestamp.seconds).strftime('%Y-%m-%dT%H:%M:%SZ'))
+                output.insert(0, SEVERITY[entry.severity])
+                entries.append(str(output))
+
+        return entries
+
+    def prep_entry(self, entry):
+        """
+        same as in FilterFinder, strips unwanted chars and removes multiple white spaces within line
+        :param entry: the log entry payload
+        :return: sanitizing string
+        """
+        entry = entry.strip().replace('[', '').replace(']','').replace("'","").replace('"',"")
+        entry = re.sub( '\s+', ' ', entry ).strip()
+        self.logger.debug('len(item): {}, item: {}'.format(len(entry),entry))
+        return entry
+
+    def get_payload(self, entry):
+        """
+        in the python logging api, the payload can be of several types. in go it's always just the entry.payload
+        :param entry: the raw log entry
+        :return: the actual payload
+        """
+        payload = ''
+        if len(entry.text_payload) > 0:
+            try:
+                payload = str(entry.text_payload).replace(',','').replace('\n', '') # lose any commas in the entry string
+            except:
+                self.logger.error(traceback.format_exc())
+
+        elif entry.json_payload:
+            try:
+                payload = str(entry.json_payload['message']).replace(',', '').replace('\n', '')
+            except:
+                self.logger.error(traceback.format_exc())
+
+        elif entry.proto_payload:
+            class_ = getattr(import_module('google.protobuf.any_pb2'), 'Any')  # class reference
+            try:
+                if entry.proto_payload.type_url.find('AuditLog') < 0:
+                    rv = class_()  # instantiate class instance
+                    rv.ParseFromString(entry.proto_payload.value)  # decode Any.value
+                    payload = str(rv)
+                else:
+                    payload = str(entry.proto_payload.value).replace('\n', '')
+            except:
+                self.logger.error(traceback.format_exc())
+
+        return payload
 
     def do_filter(self, log_entry):
         """
         filterfile_data contains substrings of common log entries. if the given entry finds one of those
-        substrings, replace the entry with that substring. This is especially useful for entries that may
-        differ in details (such as user names or ids or timestamps) that don't matter to the collection
+        substrings, replace the entry with that substring.
+        for example:
 
         :param log_entry: a log entry
         :return:
         """
         for line in self.filterfile_data:
-            line = line.rstrip('\n')
+            line = line.rstrip('\n').strip()
             self.logger.debug('checking line {}'.format(line))
             if log_entry.find(line) >= 0:
                 self.logger.debug('found line {}'.format(line))
@@ -191,80 +213,77 @@ class LogMine():
 
     def do_filter_revisions(self):
         """
-         optional filter revisions for timestamp, limit and dataflow job name as applicable
+         optional filter revisions for timestamp and dataflow job name as applicable
 
          for dataflow jobs we need the job_id not the job name
          the caller should provide a dataflow job name as the --source arg
          for example:
-         --source your-data-flow-job-name
-         --log_filter 'resource.type=dataflow_step resource.labels.job_id=DATAFLOW_JOB_NAME severity>=WARNING'
+        --source your-data-flow-job-name
+         --log_filter 'resource.type=dataflow_step resource.labels.job_id=DATAFLOW_JOB_NAME'
         :return:
         """
         if self.args.log_filter.find('DATAFLOW_JOB_NAME') >= 0:
-            job = self.get_dataflow_job_by_name(self.args.source)
+            job = self.dynamite.dataflow_client.get_job_by_name(self.args.source)
             if job:
                 self.args.log_filter = self.args.log_filter.replace('DATAFLOW_JOB_NAME', job['id'])
             else:
                 raise Exception('did not find active dataflow job for --source: {}'.format(self.args.source))
 
-        # add a time range if range_in_minutes is specified in the args, as timestamp > (NOW minus N minutes specified)
         if self.args.range_in_minutes > 0:
             start_time = (datetime.now() - timedelta(minutes=self.args.range_in_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ').upper()
             self.args.log_filter += " timestamp > \"{}\"".format(start_time)
 
-        self.logger.info('self.args.log_filter: {}'.format(self.args.log_filter))
+    def get_log_entries(self):
+        """
+        interface to google.cloud.logging client.list_entries
+        """
+        _, _, raw_entries = self.dynamite.logging.get_log_entries(log_filter=self.args.log_filter, limit=self.args.limit)
+        self.logger.debug('len(raw_entries): {}'.format(len(raw_entries)))
+        return raw_entries
 
-    def write_results(self, outfile=None):
+    def write_raw_results(self, outfile=None, entries=None):
         """
         write to disk
         :param outfile: optional output file path. defaults to args.output_file
+        :param entries: list of [SEVERITY, TIMESTAMP, TEXT] log entries
         :return:
         """
-        if not outfile:
-            outfile = self.args.output_file
+        if entries:
+            if not outfile:
+                outfile = self.args.output_file
 
-        if self.results:
+            # get rid of hex code stuff if there is any and write to file
             outfile_list = outfile
             with open(outfile_list, 'w') as f:
-                for r in self.results:
-                    # get rid of hex code stuff if there is any or substitute your own regex filtering here
+                for r in entries:
                     r = str(re.sub(r"\\x[0-9a-fA-F]{2}", "", str(r)))
-                    # write to the output file
                     f.write('{}\n'.format(r))
 
-    def do_process(self, path=None):
+    def do_process(self, entries):
         """
-        :param path: if previous query and parse, then use the *.df file from parse
-                     else load the file provided by path (expected to be a dataframe in the parsed format)
+        :param entries: list of [SEVERITY, TIMESTAMP, TEXT] log entries
 
-        process the parsed file against the input stopfile_data
+        process the log entries against the input stopfile_data
         discover new data and report it
-        overwrite stopfile and write newfile to disk
+        overwrite the stopfile and write the newfile to disk
         :return:
         """
 
-        if self.df.empty:
-            if path:
-                try:
-                    self.df = pd.read_csv(path, index_col=0, parse_dates=True)
-                except:
-                    self.logger.error('no data to process')
-                    return
-            else:
-                self.logger.error('no data to process')
-                return
+        # read in stopfile
+        self.read_stop_file()
 
-        self.logger.debug(self.df.head(5))
-
-        # read in the stopfile. this is a json file with previously seen entries and their counts
-        self.read_stopfile()
         data_counts = {}
 
-        # iterate through the log entry pandas dataframe dataset
-        self.df['Text'] = self.df.Text.astype(str)
-        for row in self.df['Text'].iteritems():
-            item = row[1]
-            self.logger.debug('row: {}'.format(item))
+        # iterate through the log entry dataset
+        # for this we are only interested in the TEXT portion of the log entries
+        # and in that, we want the first part (the log entry, not its count list)
+        for entry in entries:
+            row = entry.split(',')
+            txt = row[2].strip()
+            items = txt.rsplit(":")
+            item = self.prep_entry(items[0])
+            if len(item) < self.min_len or len(item) > self.max_len:
+                continue
             # add to counts of unique keys in this dataset
             if data_counts.has_key(item):
                 data_counts[item] += 1
@@ -274,145 +293,152 @@ class LogMine():
         # add new counts to existing stopfile entries
         # or create new stopfile entry if new data
         for k,v in data_counts.iteritems():
-            self.logger.debug('k = {}'.format(k))
-            self.logger.debug('v = {}'.format(v))
-            # if the entry has been seen before, add its data count
+            if len(k) == 0:
+                continue
+            self.logger.debug('k = {}, v = [{}]'.format(k, v))
             if k in self.stopfile_data.keys():
                 self.stopfile_data[k].append(v)
-                # truncate the entry's data count in the stopfile according to the max_entry_count length
                 if len(self.stopfile_data[k]) > self.args.max_entry_count:
                     del self.stopfile_data[k][:self.args.max_entry_count]  # keep the last max_entry_count elements only
             else:
-                # if the entry hasn't been seen before, add it to the stopfile
                 self.stopfile_data[k] = []
                 self.stopfile_data[k].append(v)
-                # if the entry hasn't been seen before, add it to the new_data list for optional email notifications
                 self.new_data[k] = [v]
 
-        # write out the new stopfile
-        self.write_stopfile(self.new_data)
+        # write out new stopfile
+        new_stopfile = []
+        for k, v in self.stopfile_data.iteritems():
+            new_stopfile.append("{}:{}".format(k,str(v)))
+        self.write_stop_file(new_stopfile)
 
-        # report on new data and write out the newfile
-        self.write_newfile(self.new_data)
+        # report new data and write out newfile
+        new_newfile = []
+        for k, v in self.new_data.iteritems():
+            new_newfile.append("{}:{}".format(k,str(v)))
+        self.write_new_file(new_newfile)
 
-    def read_stopfile(self):
+    def write_text_file(self, outfile, lines):
         """
-        reads in an existing stopfile or initializes an empty dict for that field
+        utility to write a list of lines to a text file
+        :param outfile: path to the file
+        :param lines: list of text lines
+        :return:
         """
-        infile = '{}/stopfile_{}.json'.format(self.args.output_dir, self.args.source)
+        f = open(outfile, 'w')
+        for line in lines:
+            f.write("{}\n".format(line))
+        f.flush()
+        f.close()
+
+    def read_text_file(self, infile):
+        """
+        utility to read text file into a list
+        :param infile: the file path
+        :return: list of text lines
+        """
+        lines = []
+        raw_lines = open(infile, 'r').readlines()
+        for r in raw_lines:
+            lines.append(r.replace('\n',''))
+        return lines
+
+    def write_stop_file(self, stopfile):
+        """
+        writes the stopfile entries to a text file
+        :param stopfile: the stopfile entries
+        :return:
+        """
+        outfile = '{}/stopfile_{}.txt'.format(self.args.output_dir, self.args.source)
+        self.write_text_file(outfile, stopfile)
+
+    def read_stop_file(self, infile=None):
+        """
+        read the stopfiles from disk and parse into the self.stopfiles_data dictionary
+        :return:
+        """
         try:
-            with open(infile) as f:
-                self.stopfile_data = json.load(f)
+            if not infile:
+                infile = '{}/stopfile_{}.txt'.format(self.args.output_dir, self.args.source)
+            lines = self.read_text_file(infile)
+            for l in lines:
+                counts = []
+                line = l.split(":")
+                # line 0 is the log entry, line 1 is a str list of counts that needs to be turned back into an int list
+                value = self.prep_entry(line[1])
+                values = value.split(',')
+                for v in values:
+                    counts.append(int(v))
+                self.stopfile_data[line[0]] = counts
         except:
             self.stopfile_data = {}
 
-    def read_filterfile(self):
+    def write_new_file(self, newfile):
+        """
+        writes the newfile entries to a text file
+        :param newfile: the newfile entries
+        :return:
+        """
+        outfile = '{}/newfile{}.txt'.format(self.args.output_dir, self.args.source)
+        self.write_text_file(outfile, newfile)
+
+    def read_filter_file(self, infile=None):
         """
         reads in an existing filterfile or initializes an empty list for that field
         """
-        infile = '{}/filterfile_{}.txt'.format(self.args.output_dir, self.args.source)
+        if not infile:
+            infile = '{}/filterfile_{}.txt'.format(self.args.output_dir, self.args.source)
         try:
+            self.filterfile_data = []
             with open(infile) as f:
-                self.filterfile_data = f.readlines()
+                data = f.readlines()
+                for d in data:
+                    self.filterfile_data.append(d.rstrip('\n'))
         except:
             self.filterfile_data = []
 
-    def write_stopfile(self, new_data):
+    def write_filter_file(self):
         """
-        writes the new stopfile, including new entries
-        :param new_data: dictionary of entries not previously seen in stopfile
-=        """
-        outfile = '{}/stopfile_{}.json'.format(self.args.output_dir, self.args.source)
-        self.stopfile_data.update(new_data)
-
-        with open(outfile, 'w') as f:
-            json.dump(self.stopfile_data, f, indent=4, sort_keys=True)
-
-    def write_newfile(self, new_data):
+        writes out a new filterfile with existing and additional filters found
         """
-        writes the new newfile, consisting of entries not previously seen
-        :param new_data: dictionary of entries not previously seen in stopfile
+        outfile = '{}/filterfile_{}.txt'.format(self.args.output_dir, self.args.source)
+        self.write_text_file(outfile, self.filterfile_data)
+
+    def send_requested_file(self):
+        """
+        read and format requested stop or filter files and send as email to recipients
         :return:
         """
-        outfile = '{}/newfile_{}.json'.format(self.args.output_dir, self.args.source)
-
-        with open(outfile, 'w') as f:
-            json.dump(new_data, f, indent=4, sort_keys=True)
-
-    def get_dataflow_job_by_name(self, job_name, page_size=5000):
-        """
-        returns the active dataflow job that matches the given name. returns None if the job is not found
-        """
-        page_token = None
-        while True:
-            jobs = self.dataflow_service.projects().jobs().list(projectId=self.args.project, pageSize=page_size, pageToken=page_token, filter='ACTIVE').execute()
-            for job in jobs['jobs']:
-                if job['name'].find(job_name) >= 0:
-                    return job
-            try:
-                page_token = jobs['nextPageToken']
-            except:
-                break
-        self.logger.error('job not found {}'.format(job_name))
-        return None
-
-    def get_log_entries(self, log_filter, limit=10, order_by=logging.DESCENDING):
-        """
-        use the logger_clitn interface to google.cloud.logging client.list_entries to retrieve log entries
-        :param resource_names: a list, containing the project_id
-        :param log_filter: required
-        example: filter_='resource.type=\"container\" resource.labels.cluster_name=\"qa-trinity\" \"SecurityAudit\" timestamp >= "2016-08-17T11:00:00-07:00"')
-        you can get this kind of filter from the Monitoring Logging UI, 'convert to advanced filter' dropdown option
-        :param limit: max number of desired results
-        :param order_by: descending (most-recent first) or ascending (oldest first)
-        :return: log entries found
-        """
-        
-        raw_entries = []
-        if not log_filter:
-            raise Exception('log_filter was not provided and is required')
+        infile = '{}/{}'.format(self.args.output_dir, self.args.output_file)
+        if infile.find('filterfile') >= 0:
+            self.read_filter_file(infile)
+            new_data = {}
+            for item in self.filterfile_data:  # format into a dictionary for sendmail processing
+                new_data[item] = 1
+        elif infile.find('stopfile') >= 0:
+            self.read_stop_file(infile)
+            new_data = self.stopfile_data
         else:
-            count = 0
-            entries = self.logger_client.list_log_entries(resource_names=["projects/{}".format(self.args.project)], filter_=log_filter, order_by=order_by, page_size=limit)
-            try:
-                for entry in entries:
-                    raw_entries.append(entry)
-                    self.logger.info(entry)
-                    count += 1
-                    self.logger.debug('entry count {} of {}'.format(count, limit))
-                    if count >= limit:
-                        break
-            except:
-                self.logger.error(traceback.format_exc())
+            self.logger.error('only stopfiles and filterfiles are supported by send_file')
+            return
 
-        self.logger.info('len(raw_entries): {}'.format(len(raw_entries)))
-        return raw_entries
+        subject = "(%s) Log Mine: %s - %s" % (self.args.project, infile, datetime.now().strftime("%Y-%m-%d"))
 
-    def init_logger(self, logger_name):
-        """
-        initialize system logger to a friendly format
-        :param logger_name:
-        :return:
-        """
-        self.logger = logger.getLogger(logger_name)
-        FORMAT = '%(asctime)s %(levelname)-6s %(filename)s: %(lineno)s - %(funcName)20s() %(message)s'
-        logger.basicConfig(format=FORMAT)
-        if DEBUG:
-            self.logger.setLevel(logger.DEBUG)
-        else:
-            self.logger.setLevel(logger.INFO)
+        self.logger.info('send notification(s)')
+        for recipient in self.args.recipients:
+            self.do_sendmail(self.args.sender, recipient, new_data, subject)
 
-    def do_sendmail(self, sender, recipient, new_data):
+    def do_sendmail(self, sender, recipient, new_data, subject=None):
         """
             general email routine to notify recipients of new entries
         """
-        body = "<body><table border=2><tr><td> New Entries </td><td> Entry Count </td></tr>"
+        body = "<body><table border=2><tr><td> Entries </td><td> Count </td></tr>"
         for key in sorted(new_data.keys()):
             body_part = "<tr><td>%s</td><td>%s</td></tr>" % \
                         (key, str(new_data[key]))
             body += body_part
         body += "</table></body>"
-        subject = "(%s) Log Mine: %s - %s" % (self.args.project, self.args.source, datetime.now().strftime("%Y-%m-%d"))
+        if not subject:
+            subject = "(%s) Log Mine: %s - %s" % (self.args.project, self.args.source, datetime.now().strftime("%Y-%m-%d"))
 
         self.logger.info(subject)
         self.logger.info(body)
@@ -431,21 +457,24 @@ class LogMine():
         server.sendmail(sender, [recipient], msg.as_string())
         server.quit()
 
+
 if __name__ == "__main__":
     """
 # query, parse and analyze logs using "artificial ignorance"
-python -m logmine.LogMine \
---query \
---parse \
---process \
---log_filter "resource.type="container" resource.labels.cluster_name="my-container" severity>=INFO" LIMIT 10\
+python -m boom.tools.logs.LogMine \
+--log_filter "resource.type="container" resource.labels.cluster_name="qa-trinity" severity>=WARNING" \
 --output_dir ./logmine \
---output_file my_container_output.log \
---max_entry_count 20 \
---limit 100 \
---source my-container \
+--source qa_trinity \
+--limit 1000 \
 --range_in_minutes 30 \
---project my_gcp_project   
+--max_entry_count 20 \
+--output_file qa_trinity_output.log    
+
+
+python -m boom.tools.logs.LogMine \
+--send_file true \
+--output_dir ./logmine \
+--output_file stopfile_airflow_dyna.txt
     """
 
     lm = LogMine()
