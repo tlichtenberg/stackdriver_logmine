@@ -1,15 +1,19 @@
 from argparse import ArgumentParser
-from boom.common.utils import init_logger
-from boom.common.utils import dynamite_parser
-from boom.dynamite.DynamitePod import DynamitePod
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from google.cloud.gapic.logging.v2 import logging_service_v2_client
+from google.cloud import logging
+from googleapiclient import discovery
 from importlib import import_module
+import logging as logger
+from oauth2client.client import GoogleCredentials
 import re
 import smtplib
+import sys
 import traceback
 
+DEBUG = sys.flags.debug
 FILTER2 = True
 
 if FILTER2:
@@ -30,7 +34,8 @@ SEVERITY = {
 
 class LogMine():
     def __init__(self):
-        self.logger = init_logger('LogMine')
+        self.logger = None
+        self.init_logger('LogMine')
         self.args = self.arguments()
         self.results = list()
         self.new_data = dict()
@@ -39,14 +44,9 @@ class LogMine():
         self.min_len = 16
         self.max_len = 64
         self.max_substring_length = 128  # truncate log entry payloads to 1st N characters if FILTER2
-        self.df = None  # pandas dataframe
-
-        self.dynamite = DynamitePod(pod=self.args.pod,
-                                    realm=self.args.realm,
-                                    zone=self.args.zone,
-                                    project=self.args.project,
-                                    cloud=self.args.cloud,
-                                    user=self.args.user)
+        self.logger_client = logging_service_v2_client.LoggingServiceV2Client()
+        self.credentials = GoogleCredentials.get_application_default()
+        self.dataflow_service = discovery.build('dataflow', 'v1b3', credentials=self.credentials)
 
         if self.args.send_file:
             self.send_requested_file()
@@ -80,13 +80,13 @@ class LogMine():
         argument parser
         :return: parsed args
         """
-        parser = ArgumentParser(parents=[dynamite_parser()])
+        parser = ArgumentParser()
         parser.add_argument('--limit', default=100, type=int, help='number of log entries to retrieve')
         parser.add_argument('--max_entry_count', default=20, type=int, help='max per log entry to save to file')
         parser.add_argument('--output_dir', default='/tmp')
         parser.add_argument('--range_in_minutes', type=int, default=0)
         parser.add_argument('--sender', default='no-reply@nestlabs.com')
-        parser.add_argument('--recipients', nargs='+', default=['tlichtenberg@google.com'])
+        parser.add_argument('--recipients', nargs='+', default=['somebody@somewhere.com'])
         parser.add_argument('--output_file',  required=True)
         parser.add_argument('--send_file', default=False, type=bool, help="request an email containing the file specified in output_dir and output_file")
         known_args = parser.parse_known_args()
@@ -97,6 +97,20 @@ class LogMine():
                             help="for stopfile_<source>.json and newfile_<source>.json")
 
         return parser.parse_args()
+
+    def init_logger(self, logger_name):
+        """
+        initialize system logger to a friendly format
+        :param logger_name:
+        :return:
+        """
+        self.logger = logger.getLogger(logger_name)
+        FORMAT = '%(asctime)s %(levelname)-6s %(filename)s: %(lineno)s - %(funcName)20s() %(message)s'
+        logger.basicConfig(format=FORMAT)
+        if DEBUG:
+            self.logger.setLevel(logger.DEBUG)
+        else:
+            self.logger.setLevel(logger.INFO)
 
     def do_query(self):
         """
@@ -223,7 +237,7 @@ class LogMine():
         :return:
         """
         if self.args.log_filter.find('DATAFLOW_JOB_NAME') >= 0:
-            job = self.dynamite.dataflow_client.get_job_by_name(self.args.source)
+            job = self.get_dataflow_job_by_name(self.args.source)
             if job:
                 self.args.log_filter = self.args.log_filter.replace('DATAFLOW_JOB_NAME', job['id'])
             else:
@@ -233,13 +247,55 @@ class LogMine():
             start_time = (datetime.now() - timedelta(minutes=self.args.range_in_minutes)).strftime('%Y-%m-%dT%H:%M:%SZ').upper()
             self.args.log_filter += " timestamp > \"{}\"".format(start_time)
 
-    def get_log_entries(self):
+    def get_dataflow_job_by_name(self, job_name, page_size=5000):
         """
-        interface to google.cloud.logging client.list_entries
+        returns the active dataflow job that matches the given name. returns None if the job is not found
         """
-        _, _, raw_entries = self.dynamite.logging.get_log_entries(log_filter=self.args.log_filter, limit=self.args.limit)
-        self.logger.debug('len(raw_entries): {}'.format(len(raw_entries)))
+        page_token = None
+        while True:
+            jobs = self.dataflow_service.projects().jobs().list(projectId=self.args.project, pageSize=page_size, pageToken=page_token, filter='ACTIVE').execute()
+            for job in jobs['jobs']:
+                if job['name'].find(job_name) >= 0:
+                    return job
+            try:
+                page_token = jobs['nextPageToken']
+            except:
+                break
+        self.logger.error('job not found {}'.format(job_name))
+        return None
+
+    def get_log_entries(self, log_filter, limit=10, order_by=logging.DESCENDING):
+        """
+        use the logger_clitn interface to google.cloud.logging client.list_entries to retrieve log entries
+        :param resource_names: a list, containing the project_id
+        :param log_filter: required
+        example: filter_='resource.type=\"container\" resource.labels.cluster_name=\"qa-trinity\" \"SecurityAudit\" timestamp >= "2016-08-17T11:00:00-07:00"')
+        you can get this kind of filter from the Monitoring Logging UI, 'convert to advanced filter' dropdown option
+        :param limit: max number of desired results
+        :param order_by: descending (most-recent first) or ascending (oldest first)
+        :return: log entries found
+        """
+
+        raw_entries = []
+        if not log_filter:
+            raise Exception('log_filter was not provided and is required')
+        else:
+            count = 0
+            entries = self.logger_client.list_log_entries(resource_names=["projects/{}".format(self.args.project)], filter_=log_filter, order_by=order_by, page_size=limit)
+            try:
+                for entry in entries:
+                    raw_entries.append(entry)
+                    self.logger.info(entry)
+                    count += 1
+                    self.logger.debug('entry count {} of {}'.format(count, limit))
+                    if count >= limit:
+                        break
+            except:
+                self.logger.error(traceback.format_exc())
+
+        self.logger.info('len(raw_entries): {}'.format(len(raw_entries)))
         return raw_entries
+
 
     def write_raw_results(self, outfile=None, entries=None):
         """
@@ -461,20 +517,24 @@ class LogMine():
 if __name__ == "__main__":
     """
 # query, parse and analyze logs using "artificial ignorance"
-python -m boom.tools.logs.LogMine \
---log_filter "resource.type="container" resource.labels.cluster_name="qa-trinity" severity>=WARNING" \
+python -m logmine.LogMine \
+--query \
+--parse \
+--process \
+--log_filter "resource.type="container" resource.labels.cluster_name="my-container" severity>=INFO" LIMIT 10 \
 --output_dir ./logmine \
---source qa_trinity \
---limit 1000 \
---range_in_minutes 30 \
+--output_file my_container_output.log \
 --max_entry_count 20 \
---output_file qa_trinity_output.log    
+--limit 100 \
+--source my-container \
+--range_in_minutes 30 \
+--project my_gcp_project
 
-
-python -m boom.tools.logs.LogMine \
+# retrieve formatted stopfile via email
+python -m logmine.LogMine \
 --send_file true \
 --output_dir ./logmine \
---output_file stopfile_airflow_dyna.txt
+--output_file stopfile_my_container.txt
     """
 
     lm = LogMine()
